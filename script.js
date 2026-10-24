@@ -1,12 +1,11 @@
 /* =========================================================
    HMI Finance — Monthly Target & Daily Progress Tracker
-   Vanilla JS, LocalStorage persistence. No backend required.
+   Vanilla JS + Firebase Auth + Firestore (data stored per user in the cloud).
    ========================================================= */
 
 (function () {
   "use strict";
 
-  const STORAGE_KEY = "hmiFinance.state.v1";
   const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   const EPS = 0.005;
 
@@ -110,36 +109,77 @@
     };
   }
 
-  function loadState() {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return { version: 1, currentMonth: makeDefaultMonth(), history: [] };
-      const parsed = JSON.parse(raw);
-      if (!parsed.currentMonth) parsed.currentMonth = makeDefaultMonth();
-      if (!parsed.history) parsed.history = [];
-      // Migration: older saves may not have the orders-target / off-day fields yet.
-      if (parsed.currentMonth.ordersTarget === undefined) parsed.currentMonth.ordersTarget = 450;
-      (parsed.currentMonth.days || []).forEach((d) => {
-        if (d.actualOrders === undefined) d.actualOrders = null;
-        if (d.off === undefined) d.off = false;
-      });
-      return parsed;
-    } catch (e) {
-      console.error("Failed to load state", e);
-      return { version: 1, currentMonth: makeDefaultMonth(), history: [] };
-    }
+  function freshState() {
+    return { version: 1, currentMonth: makeDefaultMonth(), history: [] };
   }
 
+  function normalizeState(parsed) {
+    if (!parsed || typeof parsed !== "object") return freshState();
+    if (!parsed.currentMonth) parsed.currentMonth = makeDefaultMonth();
+    if (!parsed.history) parsed.history = [];
+    if (parsed.currentMonth.ordersTarget === undefined) parsed.currentMonth.ordersTarget = 450;
+    (parsed.currentMonth.days || []).forEach((d) => {
+      if (d.actualOrders === undefined) d.actualOrders = null;
+      if (d.off === undefined) d.off = false;
+    });
+    return parsed;
+  }
+
+  /* -----------------------------------------------------
+     Firebase (Auth + Firestore)
+  ----------------------------------------------------- */
+  firebase.initializeApp(window.FIREBASE_CONFIG);
+  const auth = firebase.auth();
+  const db = firebase.firestore();
+  let currentUser = null;
+  let saveTimer = null;
+  let saving = false;
+  let savePending = false;
+
+  function userDoc() {
+    return db.collection("users").doc(currentUser.uid);
+  }
+
+  async function loadStateFromCloud() {
+    const snap = await userDoc().get();
+    if (snap.exists && snap.data().state) {
+      // Stored as a JSON string so nested arrays/dates round-trip exactly.
+      return normalizeState(JSON.parse(snap.data().state));
+    }
+    const fresh = freshState();
+    await userDoc().set({
+      state: JSON.stringify(fresh),
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+    });
+    return fresh;
+  }
+
+  // Debounced: rapid edits collapse into one write; never two writes at once.
   function saveState() {
+    if (!currentUser) return;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(flushSave, 400);
+  }
+
+  async function flushSave() {
+    if (!currentUser) return;
+    if (saving) { savePending = true; return; }
+    saving = true;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      await userDoc().set({
+        state: JSON.stringify(state),
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      });
     } catch (e) {
       console.error("Failed to save state", e);
-      toast("Couldn't save — storage may be full or disabled.");
+      toast("Couldn't save to the cloud — check your connection.");
+    } finally {
+      saving = false;
+      if (savePending) { savePending = false; flushSave(); }
     }
   }
 
-  let state = loadState();
+  let state = freshState();
   let todayEditMode = false; // transient — true while the inline "Edit today" form is open
 
   /* -----------------------------------------------------
@@ -506,467 +546,4 @@
     // most recently logged day, otherwise just the start of the month.
     let anchor = c.todayIndex !== -1 ? c.todayIndex : -1;
     if (anchor === -1) {
-      for (let i = moneyDays.length - 1; i >= 0; i--) {
-        if (moneyDays[i].actual !== null) {
-          anchor = i;
-          break;
-        }
-      }
-    }
-    if (anchor === -1) anchor = 0;
-
-    const start = Math.max(0, anchor - 2);
-    const indices = [];
-    for (let i = anchor; i >= start; i--) indices.push(i); // most recent first, 3 rows
-
-    if (indices.length === 0) {
-      strip.innerHTML = `<div class="recent-empty">No days yet — pick a date under "All days" to get started.</div>`;
-      return;
-    }
-
-    indices.forEach((i) => {
-      const day = moneyDays[i];
-      const orderDay = ordersDays[i];
-      const item = document.createElement("div");
-      item.className = "rs-item " + day.status + (day.date === tISO ? " is-today" : "");
-
-      if (day.off) {
-        item.innerHTML = `
-          <div class="rs-accent"></div>
-          <div class="rs-body">
-            <div class="rs-top"><span>Day ${day.index + 1} · ${formatDateShort(day.date)}</span><span>Off</span></div>
-            <div class="rs-mid"><span class="rs-amount">Day off</span></div>
-          </div>
-        `;
-        item.addEventListener("click", () => openEditDay(day.index));
-        strip.appendChild(item);
-        return;
-      }
-
-      const pct = day.adjustedTarget > 0 ? ((day.actual || 0) / day.adjustedTarget) * 100 : 0;
-      item.innerHTML = `
-        <div class="rs-accent"></div>
-        <div class="rs-body">
-          <div class="rs-top"><span>Day ${day.index + 1} · ${formatDateShort(day.date)}</span><span>${statusLabel(
-        day.status
-      )}</span></div>
-          <div class="rs-mid">
-            <span class="rs-amount">${day.actual !== null ? fmtMoney(day.actual, cur) : "—"} / ${fmtMoney(
-        day.adjustedTarget,
-        cur
-      )}</span>
-            <span class="rs-orders">${orderDay.actual !== null ? fmtNum(orderDay.actual) : "—"} / ${fmtNum(
-        orderDay.adjustedTarget
-      )} orders</span>
-          </div>
-          <div class="rs-bar"><div class="rs-bar-fill" style="width:${Math.min(100, pct)}%; background:${progressBarColor(
-        pct
-      )}"></div></div>
-        </div>
-      `;
-      item.addEventListener("click", () => openEditDay(day.index));
-      strip.appendChild(item);
-    });
-  }
-
-  /* -----------------------------------------------------
-     Today entry
-  ----------------------------------------------------- */
-  el("btnSaveToday").addEventListener("click", () => {
-    const c = computeMonth(state.currentMonth);
-    if (c.todayIndex === -1) return;
-
-    if (el("btnSaveToday").dataset.mode === "edit") {
-      todayEditMode = true;
-      render();
-      return;
-    }
-
-    const val = el("todayInput").value;
-    const ordersVal = el("todayOrdersInput").value;
-    state.currentMonth.days[c.todayIndex].actual = val === "" ? null : Math.max(0, Number(val));
-    state.currentMonth.days[c.todayIndex].actualOrders = ordersVal === "" ? null : Math.max(0, Math.round(Number(ordersVal)));
-    todayEditMode = false;
-    saveState();
-    render();
-    toast("Today's result saved.");
-  });
-
-  el("btnMarkOff").addEventListener("click", () => {
-    const c = computeMonth(state.currentMonth);
-    if (c.todayIndex === -1) return;
-    state.currentMonth.days[c.todayIndex].off = true;
-    state.currentMonth.days[c.todayIndex].actual = null;
-    state.currentMonth.days[c.todayIndex].actualOrders = null;
-    todayEditMode = false;
-    saveState();
-    render();
-    toast("Today marked as off.");
-  });
-
-  el("btnUnmarkOff").addEventListener("click", () => {
-    const c = computeMonth(state.currentMonth);
-    if (c.todayIndex === -1) return;
-    state.currentMonth.days[c.todayIndex].off = false;
-    saveState();
-    render();
-    toast("Today is back to working.");
-  });
-
-  /* -----------------------------------------------------
-     Edit day modal
-  ----------------------------------------------------- */
-  let editingIndex = null;
-
-  function openEditDay(index) {
-    const month = state.currentMonth;
-    const c = computeMonth(month);
-    const day = c.money.days[index];
-    const orderDay = c.orders.days[index];
-    editingIndex = index;
-
-    el("editDayTitle").textContent = `Day ${index + 1} · ${formatDateShort(day.date)}`;
-    el("editDayTargetInfo").textContent = `Target: ${fmtMoney(day.adjustedTarget, month.currency)} (base ${fmtMoney(
-      day.baseTarget,
-      month.currency
-    )}) · ${fmtNum(orderDay.adjustedTarget)} orders (base ${fmtNum(orderDay.baseTarget)})`;
-    el("editDayInput").value = day.actual !== null ? day.actual : "";
-    el("editDayOrdersInput").value = orderDay.actual !== null ? orderDay.actual : "";
-    el("editDayOffToggle").checked = !!day.off;
-    toggleEditDayOffUI(!!day.off);
-    openModal("editDayModal");
-  }
-
-  function toggleEditDayOffUI(isOff) {
-    el("editDayFieldAed").classList.toggle("hidden", isOff);
-    el("editDayFieldOrders").classList.toggle("hidden", isOff);
-  }
-  el("editDayOffToggle").addEventListener("change", (e) => toggleEditDayOffUI(e.target.checked));
-
-  el("btnCloseEditDay").addEventListener("click", () => closeModal("editDayModal"));
-  el("btnSaveDay").addEventListener("click", () => {
-    if (editingIndex === null) return;
-    const isOff = el("editDayOffToggle").checked;
-    const day = state.currentMonth.days[editingIndex];
-    day.off = isOff;
-    if (isOff) {
-      day.actual = null;
-      day.actualOrders = null;
-    } else {
-      const val = el("editDayInput").value;
-      const ordersVal = el("editDayOrdersInput").value;
-      day.actual = val === "" ? null : Math.max(0, Number(val));
-      day.actualOrders = ordersVal === "" ? null : Math.max(0, Math.round(Number(ordersVal)));
-    }
-    saveState();
-    closeModal("editDayModal");
-    render();
-    toast(isOff ? "Day marked as off." : "Day updated.");
-  });
-  el("btnClearDay").addEventListener("click", () => {
-    if (editingIndex === null) return;
-    state.currentMonth.days[editingIndex].actual = null;
-    state.currentMonth.days[editingIndex].actualOrders = null;
-    state.currentMonth.days[editingIndex].off = false;
-    saveState();
-    closeModal("editDayModal");
-    render();
-    toast("Entry cleared.");
-  });
-
-  /* -----------------------------------------------------
-     Calendar (All days)
-  ----------------------------------------------------- */
-  let calCursor = null; // { year, month } — month is 0-indexed
-
-  function openCalendar() {
-    const tISO = todayISO();
-    const anchorDate = calCursor ? null : isoToDate(tISO);
-    if (!calCursor) {
-      calCursor = { year: anchorDate.getFullYear(), month: anchorDate.getMonth() };
-    }
-    renderCalendar();
-    openModal("calendarModal");
-  }
-
-  function renderCalendar() {
-    const month = state.currentMonth;
-    const dateIndex = new Map(month.days.map((d, i) => [d.date, i]));
-    const tISO = todayISO();
-
-    const { year, month: m } = calCursor;
-    const label = new Date(year, m, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
-    el("calMonthLabel").textContent = label;
-
-    const firstWeekday = new Date(year, m, 1).getDay();
-    const totalDays = new Date(year, m + 1, 0).getDate();
-
-    const grid = el("calGrid");
-    grid.innerHTML = "";
-
-    for (let i = 0; i < firstWeekday; i++) {
-      const blank = document.createElement("div");
-      blank.className = "cal-cell blank";
-      grid.appendChild(blank);
-    }
-
-    for (let day = 1; day <= totalDays; day++) {
-      const iso = `${year}-${String(m + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-      const idx = dateIndex.has(iso) ? dateIndex.get(iso) : null;
-      const isWorking = idx !== null;
-      const dayData = isWorking ? month.days[idx] : null;
-      const isOff = isWorking && !!dayData.off;
-      const isLogged = isWorking && !isOff && dayData.actual !== null && dayData.actual !== undefined;
-      const isToday = iso === tISO;
-
-      const cell = document.createElement("button");
-      cell.type = "button";
-      cell.className =
-        "cal-cell " +
-        (isWorking ? "working" : "disabled") +
-        (isOff ? " off-day" : "") +
-        (isLogged ? " logged" : "") +
-        (isToday ? " today" : "");
-      cell.innerHTML = `<span>${day}</span>${isLogged ? '<i class="cal-check">✅</i>' : ""}`;
-
-      if (isWorking) {
-        cell.addEventListener("click", () => {
-          closeModal("calendarModal");
-          openEditDay(idx);
-        });
-      } else {
-        cell.disabled = true;
-      }
-      grid.appendChild(cell);
-    }
-  }
-
-  el("btnAllDays").addEventListener("click", openCalendar);
-  el("btnCloseCalendar").addEventListener("click", () => closeModal("calendarModal"));
-  el("btnCalPrev").addEventListener("click", () => {
-    calCursor.month -= 1;
-    if (calCursor.month < 0) {
-      calCursor.month = 11;
-      calCursor.year -= 1;
-    }
-    renderCalendar();
-  });
-  el("btnCalNext").addEventListener("click", () => {
-    calCursor.month += 1;
-    if (calCursor.month > 11) {
-      calCursor.month = 0;
-      calCursor.year += 1;
-    }
-    renderCalendar();
-  });
-
-  /* -----------------------------------------------------
-     Settings modal
-  ----------------------------------------------------- */
-  function openSettings() {
-    const m = state.currentMonth;
-    el("inTarget").value = m.monthlyTarget;
-    el("inOrdersTarget").value = m.ordersTarget || 0;
-    el("inCurrency").value = m.currency;
-    el("inWorkingDays").value = m.workingDays;
-    el("inStartDate").value = m.startDate;
-    const set = new Set(m.workingWeekdays);
-    document.querySelectorAll("#weekdayPicker .wd").forEach((btn) => {
-      const d = Number(btn.dataset.d);
-      btn.classList.toggle("active", set.has(d));
-    });
-    openModal("settingsModal");
-  }
-
-  document.querySelectorAll("#weekdayPicker .wd").forEach((btn) => {
-    btn.addEventListener("click", () => btn.classList.toggle("active"));
-  });
-
-  el("btnSettings").addEventListener("click", openSettings);
-  el("btnCloseSettings").addEventListener("click", () => closeModal("settingsModal"));
-
-  el("btnSaveSettings").addEventListener("click", () => {
-    const target = Math.max(0, Number(el("inTarget").value) || 0);
-    const ordersTarget = Math.max(0, Math.round(Number(el("inOrdersTarget").value) || 0));
-    const currency = (el("inCurrency").value || "AED").trim().slice(0, 6) || "AED";
-    const workingDays = Math.max(1, Math.round(Number(el("inWorkingDays").value) || 1));
-    const startDate = el("inStartDate").value || todayISO();
-    const weekdaySet = new Set(
-      Array.from(document.querySelectorAll("#weekdayPicker .wd.active")).map((b) => Number(b.dataset.d))
-    );
-
-    const m = state.currentMonth;
-    m.monthlyTarget = target;
-    m.ordersTarget = ordersTarget;
-    m.currency = currency;
-    m.days = rebuildDays(m.days, workingDays, startDate, weekdaySet);
-    m.workingDays = workingDays;
-    m.startDate = startDate;
-    m.workingWeekdays = Array.from(weekdaySet).sort();
-    todayEditMode = false;
-
-    saveState();
-    closeModal("settingsModal");
-    render();
-    toast("Settings saved.");
-  });
-
-  /* -----------------------------------------------------
-     Clear month / New month
-  ----------------------------------------------------- */
-  el("btnClearMonth").addEventListener("click", () => {
-    confirmAction(
-      "Are you sure you want to clear this month's data? This action cannot be undone.",
-      "Clear month",
-      () => {
-        state.currentMonth.days = state.currentMonth.days.map((d) => ({ date: d.date, actual: null, actualOrders: null }));
-        todayEditMode = false;
-        saveState();
-        render();
-        toast("Month cleared.");
-      }
-    );
-  });
-
-  el("btnNewMonth").addEventListener("click", () => {
-    confirmAction(
-      "Start a new month? The current month will be saved to History and a fresh tracker will begin.",
-      "Start new month",
-      () => {
-        archiveCurrentMonth();
-        const next = makeDefaultMonth(todayISO());
-        // carry forward the same settings as a convenience
-        next.monthlyTarget = state.currentMonth ? next.monthlyTarget : 5000;
-        state.currentMonth = next;
-        todayEditMode = false;
-        saveState();
-        render();
-        toast("New month started.");
-      }
-    );
-  });
-
-  function archiveCurrentMonth() {
-    const m = state.currentMonth;
-    const c = computeMonth(m);
-    state.history.unshift({
-      id: m.id,
-      monthLabel: monthLabelForDate(m.startDate),
-      currency: m.currency,
-      target: m.monthlyTarget,
-      achieved: c.money.totalAchieved,
-      percent: Math.round(c.money.pct),
-      ordersTarget: m.ordersTarget || 0,
-      ordersAchieved: c.orders.totalAchieved,
-      ordersPercent: Math.round(c.orders.pct),
-      workingDays: m.workingDays,
-      completedDays: c.money.completedCount,
-      status: c.money.pct >= 100 ? "Completed" : "Incomplete",
-      days: c.money.days.map((d, i) => ({
-        date: d.date,
-        actual: d.actual,
-        adjustedTarget: d.adjustedTarget,
-        actualOrders: c.orders.days[i].actual,
-        ordersAdjustedTarget: c.orders.days[i].adjustedTarget,
-      })),
-    });
-  }
-
-  /* -----------------------------------------------------
-     History view
-  ----------------------------------------------------- */
-  el("btnHistory").addEventListener("click", () => {
-    renderHistory();
-    el("historyView").classList.remove("hidden");
-  });
-  el("btnBackFromHistory").addEventListener("click", () => {
-    el("historyView").classList.add("hidden");
-  });
-
-  function renderHistory() {
-    const wrap = el("historyList");
-    wrap.innerHTML = "";
-    if (state.history.length === 0) {
-      wrap.innerHTML = `<div class="empty-state">No past months yet.<br>Start a new month to build your history.</div>`;
-      return;
-    }
-    state.history.forEach((h) => {
-      const item = document.createElement("div");
-      item.className = "history-item";
-      item.innerHTML = `
-        <div class="history-item-top">
-          <div class="history-month">${h.monthLabel}</div>
-          <div class="history-pct">${h.percent}%</div>
-        </div>
-        <div class="history-sub">${fmtMoney(h.achieved, h.currency)} of ${fmtMoney(h.target, h.currency)} · ${
-        h.completedDays
-      }/${h.workingDays} days · ${h.status}</div>
-        <div class="history-sub">${fmtNum(h.ordersAchieved || 0)} of ${fmtNum(h.ordersTarget || 0)} orders (${
-        h.ordersPercent || 0
-      }%)</div>
-        <div class="history-days">
-          ${h.days
-            .map(
-              (d) =>
-                `<div class="history-day-row"><span>${formatDateShort(d.date)}</span><span>${
-                  d.actual === null ? "—" : fmtMoney(d.actual, h.currency)
-                } / ${fmtMoney(d.adjustedTarget, h.currency)}</span></div>`
-            )
-            .join("")}
-        </div>
-      `;
-      item.addEventListener("click", () => item.classList.toggle("open"));
-      wrap.appendChild(item);
-    });
-  }
-
-  /* -----------------------------------------------------
-     Generic confirm modal
-  ----------------------------------------------------- */
-  let confirmCallback = null;
-  function confirmAction(text, okLabel, cb) {
-    el("confirmText").textContent = text;
-    el("btnConfirmOk").textContent = okLabel || "Confirm";
-    confirmCallback = cb;
-    openModal("confirmModal");
-  }
-  el("btnConfirmCancel").addEventListener("click", () => closeModal("confirmModal"));
-  el("btnConfirmOk").addEventListener("click", () => {
-    const cb = confirmCallback;
-    confirmCallback = null;
-    closeModal("confirmModal");
-    if (cb) cb();
-  });
-
-  /* -----------------------------------------------------
-     Modal helpers
-  ----------------------------------------------------- */
-  function openModal(id) {
-    el(id).classList.remove("hidden");
-  }
-  function closeModal(id) {
-    el(id).classList.add("hidden");
-  }
-  document.querySelectorAll(".modal-backdrop").forEach((backdrop) => {
-    backdrop.addEventListener("click", (e) => {
-      if (e.target === backdrop) backdrop.classList.add("hidden");
-    });
-  });
-
-  /* -----------------------------------------------------
-     Toast
-  ----------------------------------------------------- */
-  let toastTimer = null;
-  function toast(msg) {
-    const t = el("toast");
-    t.textContent = msg;
-    t.classList.remove("hidden");
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => t.classList.add("hidden"), 2200);
-  }
-
-  /* -----------------------------------------------------
-     Init
-  ----------------------------------------------------- */
-  render();
-})();
+      for (let i = moneyDays.length - 1; i >= 0; i-
