@@ -750,3 +750,36 @@ button:focus-visible, input:focus-visible{
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
+
+
+/* ---------- Auth ---------- */
+body:not(.is-authed) .app { display: none; }
+.auth-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  display: flex; align-items: center; justify-content: center;
+  padding: max(20px, env(safe-area-inset-top)) 20px max(20px, env(safe-area-inset-bottom));
+  background: #fff; overflow-y: auto;
+}
+.auth-overlay.hidden { display: none; }
+.auth-card { width: 100%; max-width: 380px; font-family: "Inter", system-ui, sans-serif; }
+.auth-brand { justify-content: center; margin-bottom: 24px; }
+.auth-card h2 { font-family: "Newsreader", serif; font-weight: 500; font-size: 28px; margin: 0 0 18px; text-align: center; }
+.auth-card label { display: block; font-size: 13px; font-weight: 500; margin: 12px 0 6px; color: #555; }
+.auth-card input {
+  width: 100%; box-sizing: border-box; padding: 12px 14px; font: inherit; font-size: 16px;
+  border: 1px solid #ddd; border-radius: 10px; background: #fff; color: inherit;
+}
+.auth-card input:focus { outline: none; border-color: currentColor; }
+.auth-error { min-height: 20px; margin: 10px 0 4px; font-size: 13px; color: #c0392b; }
+.auth-primary, .auth-google {
+  width: 100%; padding: 13px 14px; font: inherit; font-weight: 600; font-size: 15px;
+  border-radius: 10px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 10px;
+}
+.auth-primary { border: 0; background: #111; color: #fff; }
+.auth-primary:disabled { opacity: .6; cursor: default; }
+.auth-google { border: 1px solid #ddd; background: #fff; color: #222; }
+.auth-link { background: none; border: 0; padding: 0; font: inherit; font-size: 13px; color: #555; text-decoration: underline; cursor: pointer; }
+#authForgot { display: block; margin: 12px auto 0; }
+.auth-divider { display: flex; align-items: center; gap: 12px; margin: 18px 0; color: #999; font-size: 12px; }
+.auth-divider::before, .auth-divider::after { content: ""; flex: 1; height: 1px; background: #e5e5e5; }
+.auth-switch { margin-top: 20px; text-align: center; font-size: 13px; color: #666; }
